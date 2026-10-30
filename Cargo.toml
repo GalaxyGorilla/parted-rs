@@ -1,0 +1,16 @@
+[package]
+name = "parted"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A clean-room, Rust-only disk partitioning tool"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+overflow-checks = true
+strip = "symbols"
