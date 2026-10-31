@@ -156,6 +156,7 @@ impl Mbr {
             .collect();
         Disk {
             kind: LabelKind::Mbr,
+            disk_guid: None,
             logical_block_size: block_size,
             blocks,
             usable: LbaRange {

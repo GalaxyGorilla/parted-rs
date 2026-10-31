@@ -230,6 +230,12 @@ fn build_plan(device: &Device, args: &[String], unit: &str) -> Result<Plan> {
         Some("set") if args.len() == 4 && args[2] == "boot" => {
             plan::set_boot(device, parse_number(&args[1])?, parse_switch(&args[3])?)
         }
+        Some("set") if args.len() == 5 && args[2] == "attribute" => plan::set_attribute(
+            device,
+            parse_number(&args[1])?,
+            parse_attribute_bit(&args[3])?,
+            parse_switch(&args[4])?,
+        ),
         _ => Err(Error::Invalid(
             "invalid command arguments; use --help".into(),
         )),
@@ -274,6 +280,16 @@ fn parse_switch(text: &str) -> Result<bool> {
         "off" => Ok(false),
         _ => Err(Error::Invalid("switch value must be on or off".into())),
     }
+}
+
+fn parse_attribute_bit(text: &str) -> Result<u8> {
+    let bit = text
+        .parse()
+        .map_err(|_| Error::Invalid(format!("invalid GPT attribute bit: {text}")))?;
+    if bit > 63 {
+        return Err(Error::Invalid("GPT attribute bit must be 0..63".into()));
+    }
+    Ok(bit)
 }
 
 fn parse_lba(text: &str, default_unit: &str, block_size: u32, end: bool) -> Result<u64> {
@@ -405,22 +421,31 @@ fn print_reread_warning(warning: Option<&str>) {
 
 fn print_disk(disk: &Disk, json: bool, include_free: bool) -> Result<()> {
     if json {
+        print!("{{\"label\":\"{}\",\"disk_guid\":", label_name(disk.kind),);
+        match &disk.disk_guid {
+            Some(guid) => print!("\"{}\"", json_escape(guid)),
+            None => print!("null"),
+        }
         print!(
-            "{{\"label\":\"{}\",\"logical_block_size\":{},\"blocks\":{},\"partitions\":[",
-            label_name(disk.kind),
-            disk.logical_block_size,
-            disk.blocks
+            ",\"logical_block_size\":{},\"blocks\":{},\"partitions\":[",
+            disk.logical_block_size, disk.blocks
         );
         for (index, part) in disk.partitions.iter().enumerate() {
             if index != 0 {
                 print!(",");
             }
+            let unique_id = part
+                .unique_id
+                .as_deref()
+                .map(|guid| format!("\"{}\"", json_escape(guid)))
+                .unwrap_or_else(|| "null".into());
             print!(
-                "{{\"number\":{},\"first_lba\":{},\"last_lba\":{},\"type\":\"{}\",\"name\":\"{}\",\"attributes\":{},\"bootable\":{}}}",
+                "{{\"number\":{},\"first_lba\":{},\"last_lba\":{},\"type\":\"{}\",\"unique_id\":{},\"name\":\"{}\",\"attributes\":{},\"bootable\":{}}}",
                 part.number,
                 part.range.first,
                 part.range.last,
                 json_escape(&part.type_id),
+                unique_id,
                 json_escape(&part.name),
                 part.attributes,
                 part.bootable
@@ -448,17 +473,28 @@ fn print_disk(disk: &Disk, json: bool, include_free: bool) -> Result<()> {
             disk.logical_block_size,
             disk.blocks
         );
-        println!("Number  Start  End  Sectors  Type  Name  Flags");
+        if let Some(guid) = &disk.disk_guid {
+            println!("Disk GUID: {guid}");
+        }
+        println!("Number  Start  End  Sectors  Type  Unique ID  Name  Flags");
         for part in &disk.partitions {
+            let mut flags = Vec::new();
+            if part.bootable {
+                flags.push("boot".to_owned());
+            }
+            if part.attributes != 0 {
+                flags.push(format!("attrs=0x{:016x}", part.attributes));
+            }
             println!(
-                "{}  {}  {}  {}  {}  {}  {}",
+                "{}  {}  {}  {}  {}  {}  {}  {}",
                 part.number,
                 part.range.first,
                 part.range.last,
                 part.range.blocks(),
                 part.type_id,
+                part.unique_id.as_deref().unwrap_or("-"),
                 part.name,
-                if part.bootable { "boot" } else { "" }
+                flags.join(",")
             );
         }
         if include_free {

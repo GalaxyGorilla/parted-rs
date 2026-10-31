@@ -154,6 +154,7 @@ impl Gpt {
             .collect();
         Disk {
             kind: LabelKind::Gpt,
+            disk_guid: Some(format_guid(self.disk_guid)),
             logical_block_size: self.block_size,
             blocks: self.blocks,
             usable: LbaRange {

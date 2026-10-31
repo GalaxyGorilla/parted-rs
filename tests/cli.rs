@@ -38,6 +38,7 @@ fn json_write_print_dry_run_and_restore_are_machine_readable() {
     let image = temp_path("img");
     let label_backup = temp_path("label.bak");
     let part_backup = temp_path("part.bak");
+    let attribute_backup = temp_path("attribute.bak");
     std::fs::write(&image, vec![0; 8 * 1024 * 1024]).unwrap();
 
     let output = run(&[
@@ -60,6 +61,7 @@ fn json_write_print_dry_run_and_restore_are_machine_readable() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(stdout.lines().count(), 1);
     assert!(stdout.contains("\"label\":\"gpt\""));
+    assert!(stdout.contains("\"disk_guid\":\""));
 
     let before = std::fs::read(&image).unwrap();
     let output = run(&[
@@ -96,6 +98,33 @@ fn json_write_print_dry_run_and_restore_are_machine_readable() {
             .unwrap()
             .contains("\"first_lba\":2048,\"last_lba\":8191")
     );
+    let output = run(&["--json", path(&image), "print"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("\"unique_id\":\"")
+    );
+
+    let output = run(&[
+        "--script",
+        "--backup",
+        path(&attribute_backup),
+        path(&image),
+        "set",
+        "1",
+        "attribute",
+        "60",
+        "on",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let output = run(&["--json", path(&image), "print"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("\"attributes\":1152921504606846976")
+    );
 
     let output = run(&[
         "--script",
@@ -113,6 +142,7 @@ fn json_write_print_dry_run_and_restore_are_machine_readable() {
     std::fs::remove_file(image).unwrap();
     std::fs::remove_file(label_backup).unwrap();
     std::fs::remove_file(part_backup).unwrap();
+    std::fs::remove_file(attribute_backup).unwrap();
 }
 
 #[test]

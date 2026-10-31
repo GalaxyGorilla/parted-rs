@@ -55,6 +55,7 @@ pub enum LabelKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Disk {
     pub kind: LabelKind,
+    pub disk_guid: Option<String>,
     pub logical_block_size: u32,
     pub blocks: u64,
     pub usable: LbaRange,
@@ -128,6 +129,7 @@ mod tests {
     fn computes_free_ranges() {
         let disk = Disk {
             kind: LabelKind::Mbr,
+            disk_guid: None,
             logical_block_size: 512,
             blocks: 100,
             usable: LbaRange { first: 1, last: 99 },

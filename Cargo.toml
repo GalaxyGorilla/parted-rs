@@ -6,6 +6,9 @@ rust-version = "1.88"
 description = "A clean-room, Rust-only disk partitioning tool"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/GalaxyGorilla/parted-rs"
+keywords = ["partition", "gpt", "mbr", "disk", "cli"]
+categories = ["command-line-utilities", "filesystem"]
 
 [dependencies]
 

@@ -49,6 +49,7 @@ Usage:
   parted [OPTIONS] DEVICE name NUMBER NAME
   parted [OPTIONS] DEVICE type NUMBER TYPE
   parted [OPTIONS] DEVICE set NUMBER boot on|off
+  parted [OPTIONS] DEVICE set NUMBER attribute BIT on|off
   parted [OPTIONS] DEVICE restore BACKUP
 
 Global options:

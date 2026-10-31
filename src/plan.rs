@@ -288,8 +288,41 @@ pub fn set_boot(device: &Device, number: u32, enabled: bool) -> Result<Plan> {
             mbr_plan(device, format!("set partition {number} boot flag"), &mbr)
         }
         Table::Gpt(_) => Err(Error::Invalid(
-            "the MBR boot flag is not defined for GPT; use GPT attributes instead".into(),
+            "the MBR boot flag is not defined for GPT; use set NUMBER attribute BIT on|off".into(),
         )),
+    }
+}
+
+pub fn set_attribute(device: &Device, number: u32, bit: u8, enabled: bool) -> Result<Plan> {
+    if bit > 63 {
+        return Err(Error::Invalid("GPT attribute bit must be 0..63".into()));
+    }
+    let index = partition_index(number)?;
+    match detect(device)? {
+        Table::Mbr(_) => Err(Error::Invalid(
+            "GPT attributes are not defined for MBR partitions".into(),
+        )),
+        Table::Gpt(mut gpt) => {
+            let entry = gpt
+                .entries
+                .get_mut(index)
+                .and_then(Option::as_mut)
+                .ok_or_else(|| Error::Invalid(format!("partition {number} does not exist")))?;
+            let mask = 1_u64 << bit;
+            if enabled {
+                entry.attributes |= mask;
+            } else {
+                entry.attributes &= !mask;
+            }
+            gpt_plan(
+                device,
+                format!(
+                    "{} GPT attribute bit {bit} on partition {number}",
+                    if enabled { "set" } else { "clear" }
+                ),
+                gpt,
+            )
+        }
     }
 }
 
@@ -474,6 +507,14 @@ mod tests {
         assert_eq!(model.partitions[0].name, "renamed");
         assert_eq!(model.partitions[0].type_id, type_guid);
         assert!(set_boot(&device, 1, true).is_err());
+        apply(&device, &set_attribute(&device, 1, 60, true).unwrap());
+        assert_eq!(
+            read_model(&device).unwrap().partitions[0].attributes,
+            1_u64 << 60
+        );
+        apply(&device, &set_attribute(&device, 1, 60, false).unwrap());
+        assert_eq!(read_model(&device).unwrap().partitions[0].attributes, 0);
+        assert!(set_attribute(&device, 1, 64, true).is_err());
         apply(&device, &resizepart(&device, 1, start + 199).unwrap());
         assert!(
             mkpart(
