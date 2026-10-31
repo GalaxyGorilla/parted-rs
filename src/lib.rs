@@ -66,4 +66,12 @@ Sector-unit ranges use inclusive LBAs. Byte-unit ranges use exact [START, END)
 boundaries, so an END of 1MiB ends at LBA 2047 on 512-byte sectors. Bare
 numbers use --unit. No filesystem is resized and partition contents are never
 moved.
+
+Start safely:
+  parted DEVICE print free
+  parted --dry-run DEVICE mkpart 1MiB 32MiB --name data
+
+Writes prompt for the exact word \"yes\" unless --script is present. Use an
+explicit --backup path on separate storage for real devices. Shrink a
+filesystem before shrinking its partition.
 ";
