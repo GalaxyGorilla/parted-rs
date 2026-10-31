@@ -208,11 +208,37 @@ impl Gpt {
                 "only 128-entry GPT tables are writable".into(),
             ));
         }
+        if !matches!(self.block_size, 512 | 4096) || self.disk_guid == [0; 16] {
+            return Err(Error::Invalid(
+                "invalid writable GPT geometry or disk GUID".into(),
+            ));
+        }
+        let metadata_blocks = array_blocks(self.block_size, DEFAULT_ENTRIES, ENTRY_SIZE)?;
+        let minimum_first = 2_u64
+            .checked_add(metadata_blocks)
+            .ok_or_else(|| Error::Invalid("GPT metadata range overflow".into()))?;
+        let maximum_last = self
+            .blocks
+            .checked_sub(metadata_blocks + 2)
+            .ok_or_else(|| Error::Invalid("device is too small for GPT metadata".into()))?;
+        if self.first_usable < minimum_first
+            || self.last_usable > maximum_last
+            || self.first_usable > self.last_usable
+        {
+            return Err(Error::Invalid("invalid writable GPT usable range".into()));
+        }
         let mut ranges = Vec::new();
+        let mut unique_guids = Vec::new();
         for entry in self.entries.iter().flatten() {
             if entry.type_guid == [0; 16] || entry.unique_guid == [0; 16] {
                 return Err(Error::Invalid("GPT partition GUIDs must be nonzero".into()));
             }
+            if unique_guids.contains(&entry.unique_guid) {
+                return Err(Error::Invalid(
+                    "GPT partition unique GUIDs must not be duplicated".into(),
+                ));
+            }
+            unique_guids.push(entry.unique_guid);
             if entry.first_lba > entry.last_lba
                 || entry.first_lba < self.first_usable
                 || entry.last_lba > self.last_usable
@@ -353,6 +379,7 @@ fn parse_entries(
 ) -> Result<Vec<Option<GptEntry>>> {
     let mut result = Vec::with_capacity(count as usize);
     let mut ranges = Vec::new();
+    let mut unique_guids = Vec::new();
     for index in 0..count as usize {
         let raw = &bytes[index * size as usize..(index + 1) * size as usize];
         if raw[..16] == [0; 16] {
@@ -371,6 +398,13 @@ fn parse_entries(
                 index + 1
             )));
         }
+        let unique_guid: [u8; 16] = raw[16..32].try_into().unwrap();
+        if unique_guids.contains(&unique_guid) {
+            return Err(Error::Invalid(
+                "GPT partition unique GUIDs must not be duplicated".into(),
+            ));
+        }
+        unique_guids.push(unique_guid);
         let first_lba = le_u64(&raw[32..40]);
         let last_lba = le_u64(&raw[40..48]);
         let range = LbaRange::new(first_lba, last_lba)?;
@@ -395,7 +429,7 @@ fn parse_entries(
             .map_err(|_| Error::Invalid("GPT partition name is invalid UTF-16".into()))?;
         result.push(Some(GptEntry {
             type_guid: raw[0..16].try_into().unwrap(),
-            unique_guid: raw[16..32].try_into().unwrap(),
+            unique_guid,
             first_lba,
             last_lba,
             attributes: le_u64(&raw[48..56]),
@@ -535,5 +569,29 @@ mod tests {
     #[test]
     fn roundtrip_4096() {
         roundtrip(4096);
+    }
+
+    #[test]
+    fn rejects_duplicate_partition_guids() {
+        let mut gpt = Gpt::empty(512, 4096).unwrap();
+        for (index, first_lba) in [gpt.first_usable, gpt.first_usable + 20]
+            .into_iter()
+            .enumerate()
+        {
+            gpt.entries[index] = Some(GptEntry {
+                type_guid: [1; 16],
+                unique_guid: [2; 16],
+                first_lba,
+                last_lba: first_lba + 9,
+                attributes: 0,
+                name: String::new(),
+            });
+        }
+        assert!(
+            gpt.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicated")
+        );
     }
 }

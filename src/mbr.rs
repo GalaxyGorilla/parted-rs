@@ -68,6 +68,12 @@ impl Mbr {
             let last = u64::from(first_lba)
                 .checked_add(u64::from(sectors) - 1)
                 .ok_or_else(|| Error::Invalid("MBR partition range overflow".into()))?;
+            if last > u64::from(u32::MAX) {
+                return Err(Error::Invalid(format!(
+                    "MBR entry {} ends beyond the 32-bit LBA address space",
+                    index + 1
+                )));
+            }
             let range = LbaRange {
                 first: u64::from(first_lba),
                 last,
@@ -109,7 +115,11 @@ impl Mbr {
             let last = u64::from(entry.first_lba)
                 .checked_add(u64::from(entry.sectors).saturating_sub(1))
                 .ok_or_else(|| Error::Invalid("MBR partition range overflow".into()))?;
-            if entry.first_lba == 0 || entry.sectors == 0 || last >= device_blocks {
+            if entry.first_lba == 0
+                || entry.sectors == 0
+                || last > u64::from(u32::MAX)
+                || last >= device_blocks
+            {
                 return Err(Error::Invalid("MBR partition is outside the device".into()));
             }
             let offset = ENTRY_OFFSET + index * ENTRY_SIZE;
@@ -150,7 +160,7 @@ impl Mbr {
             blocks,
             usable: LbaRange {
                 first: 1,
-                last: blocks - 1,
+                last: (blocks - 1).min(u64::from(u32::MAX)),
             },
             partitions,
         }
@@ -186,5 +196,23 @@ mod tests {
             });
         }
         assert!(mbr.bytes(100).is_err());
+    }
+
+    #[test]
+    fn rejects_partition_ending_beyond_32_bit_lba() {
+        let mut mbr = Mbr::empty();
+        mbr.entries[0] = Some(MbrEntry {
+            bootable: false,
+            partition_type: 0x83,
+            first_lba: u32::MAX,
+            sectors: 2,
+            chs_first: [0xff; 3],
+            chs_last: [0xff; 3],
+        });
+        assert!(mbr.bytes(u64::from(u32::MAX) + 2).is_err());
+        assert_eq!(
+            mbr.model(512, u64::from(u32::MAX) + 2).usable.last,
+            u64::from(u32::MAX)
+        );
     }
 }

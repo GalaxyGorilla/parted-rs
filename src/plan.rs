@@ -7,19 +7,36 @@ use crate::{Error, Result};
 
 #[derive(Clone, Debug)]
 pub struct Write {
-    pub lba: u64,
-    pub bytes: Vec<u8>,
+    pub(crate) lba: u64,
+    pub(crate) bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Plan {
-    pub operation: String,
-    pub label: LabelKind,
-    pub writes: Vec<Write>,
+    operation: String,
+    label: LabelKind,
+    pub(crate) writes: Vec<Write>,
+    expected: Vec<Write>,
+    target_size: u64,
+    block_size: u32,
+    identity: (u64, u64),
 }
 
 impl Plan {
+    pub fn operation(&self) -> &str {
+        &self.operation
+    }
+
+    pub fn label(&self) -> LabelKind {
+        self.label
+    }
+
     pub fn touched_ranges(&self, block_size: u32) -> Result<Vec<LbaRange>> {
+        if block_size != self.block_size {
+            return Err(Error::Invalid(
+                "plan block size does not match target".into(),
+            ));
+        }
         let mut ranges = Vec::new();
         for write in &self.writes {
             if write.bytes.is_empty() || !write.bytes.len().is_multiple_of(block_size as usize) {
@@ -35,6 +52,26 @@ impl Plan {
             });
         }
         Ok(ranges)
+    }
+
+    pub(crate) fn validate_target(&self, device: &Device) -> Result<()> {
+        if device.size() != self.target_size
+            || device.block_size() != self.block_size
+            || device.identity()? != self.identity
+        {
+            return Err(Error::Refused(
+                "planned target identity or geometry changed".into(),
+            ));
+        }
+        for expected in &self.expected {
+            let blocks = expected.bytes.len() as u64 / u64::from(self.block_size);
+            if device.read_lba(expected.lba, blocks)? != expected.bytes {
+                return Err(Error::Refused(
+                    "partition metadata changed after planning; refusing stale plan".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -57,13 +94,10 @@ pub fn mklabel(device: &Device, kind: LabelKind) -> Result<Plan> {
                 lba: 0,
                 bytes: sector,
             });
-            Ok(Plan {
-                operation: "create MBR label".into(),
-                label: kind,
-                writes,
-            })
+            finalize_plan(device, "create MBR label", kind, writes)
         }
         LabelKind::Gpt => gpt_plan(
+            device,
             "create GPT label",
             Gpt::empty(device.block_size(), device.blocks())?,
         ),
@@ -88,6 +122,11 @@ pub fn mkpart(
                 .iter()
                 .position(Option::is_none)
                 .ok_or_else(|| Error::Invalid("MBR has no free primary entry".into()))?;
+            if range.last > u64::from(u32::MAX) {
+                return Err(Error::Invalid(
+                    "MBR end exceeds the 32-bit LBA address space".into(),
+                ));
+            }
             let first_lba = u32::try_from(range.first)
                 .map_err(|_| Error::Invalid("MBR start exceeds 32-bit LBA".into()))?;
             let sectors = u32::try_from(range.blocks())
@@ -122,7 +161,7 @@ pub fn mkpart(
                 attributes: 0,
                 name: name.unwrap_or("").into(),
             });
-            gpt_plan(format!("create partition {}", slot + 1), gpt)
+            gpt_plan(device, format!("create partition {}", slot + 1), gpt)
         }
     }
 }
@@ -151,7 +190,7 @@ pub fn rm(device: &Device, number: u32) -> Result<Plan> {
             if slot.take().is_none() {
                 return Err(Error::Invalid(format!("partition {number} does not exist")));
             }
-            gpt_plan(format!("remove partition {number}"), gpt)
+            gpt_plan(device, format!("remove partition {number}"), gpt)
         }
     }
 }
@@ -171,6 +210,11 @@ pub fn resizepart(device: &Device, number: u32, new_last: u64) -> Result<Plan> {
             if new_last < u64::from(entry.first_lba) {
                 return Err(Error::Invalid("new end is before partition start".into()));
             }
+            if new_last > u64::from(u32::MAX) {
+                return Err(Error::Invalid(
+                    "MBR end exceeds the 32-bit LBA address space".into(),
+                ));
+            }
             entry.sectors = u32::try_from(new_last - u64::from(entry.first_lba) + 1)
                 .map_err(|_| Error::Invalid("MBR length exceeds 32-bit sector count".into()))?;
             mbr_plan(device, format!("resize partition {number}"), &mbr)
@@ -185,7 +229,7 @@ pub fn resizepart(device: &Device, number: u32, new_last: u64) -> Result<Plan> {
                 return Err(Error::Invalid("new end is before partition start".into()));
             }
             entry.last_lba = new_last;
-            gpt_plan(format!("resize partition {number}"), gpt)
+            gpt_plan(device, format!("resize partition {number}"), gpt)
         }
     }
 }
@@ -201,7 +245,7 @@ pub fn name(device: &Device, number: u32, value: &str) -> Result<Plan> {
                 .and_then(Option::as_mut)
                 .ok_or_else(|| Error::Invalid(format!("partition {number} does not exist")))?;
             entry.name = value.into();
-            gpt_plan(format!("name partition {number}"), gpt)
+            gpt_plan(device, format!("name partition {number}"), gpt)
         }
     }
 }
@@ -226,7 +270,7 @@ pub fn set_type(device: &Device, number: u32, value: &str) -> Result<Plan> {
                 .and_then(Option::as_mut)
                 .ok_or_else(|| Error::Invalid(format!("partition {number} does not exist")))?;
             entry.type_guid = parse_guid(value)?;
-            gpt_plan(format!("set partition {number} type"), gpt)
+            gpt_plan(device, format!("set partition {number} type"), gpt)
         }
     }
 }
@@ -291,25 +335,56 @@ fn detect(device: &Device) -> Result<Table> {
 fn mbr_plan(device: &Device, operation: String, mbr: &Mbr) -> Result<Plan> {
     let mut sector = device.read_lba(0, 1)?;
     sector[..512].copy_from_slice(&mbr.bytes(device.blocks())?);
-    Ok(Plan {
+    finalize_plan(
+        device,
         operation,
-        label: LabelKind::Mbr,
-        writes: vec![Write {
+        LabelKind::Mbr,
+        vec![Write {
             lba: 0,
             bytes: sector,
         }],
-    })
+    )
 }
 
-fn gpt_plan(operation: impl Into<String>, gpt: Gpt) -> Result<Plan> {
+fn gpt_plan(device: &Device, operation: impl Into<String>, gpt: Gpt) -> Result<Plan> {
+    let writes = gpt
+        .writes()?
+        .into_iter()
+        .map(|(lba, bytes)| Write { lba, bytes })
+        .collect();
+    finalize_plan(device, operation, LabelKind::Gpt, writes)
+}
+
+fn finalize_plan(
+    device: &Device,
+    operation: impl Into<String>,
+    label: LabelKind,
+    writes: Vec<Write>,
+) -> Result<Plan> {
+    let mut expected = Vec::with_capacity(writes.len());
+    for write in &writes {
+        if write.bytes.is_empty()
+            || !write
+                .bytes
+                .len()
+                .is_multiple_of(device.block_size() as usize)
+        {
+            return Err(Error::Invalid("planned write is not block aligned".into()));
+        }
+        let blocks = write.bytes.len() as u64 / u64::from(device.block_size());
+        expected.push(Write {
+            lba: write.lba,
+            bytes: device.read_lba(write.lba, blocks)?,
+        });
+    }
     Ok(Plan {
         operation: operation.into(),
-        label: LabelKind::Gpt,
-        writes: gpt
-            .writes()?
-            .into_iter()
-            .map(|(lba, bytes)| Write { lba, bytes })
-            .collect(),
+        label,
+        writes,
+        expected,
+        target_size: device.size(),
+        block_size: device.block_size(),
+        identity: device.identity()?,
     })
 }
 

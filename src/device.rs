@@ -2,9 +2,10 @@ use crate::{Error, Result};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+const O_EXCL: i32 = 0x80;
 const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;
 const LOCK_UN: i32 = 8;
@@ -31,7 +32,24 @@ pub struct Device {
 impl Device {
     pub fn open(path: impl AsRef<Path>, writable: bool, image_sector: Option<u32>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new().read(true).write(writable).open(&path)?;
+        let path_metadata = std::fs::metadata(&path)?;
+        let block_device = path_metadata.file_type().is_block_device();
+        let mut options = OpenOptions::new();
+        options.read(true).write(writable);
+        if writable && block_device {
+            // Linux gives an O_EXCL block-device opener an exclusive claim. Unlike
+            // flock, this also blocks mounting while this descriptor remains open.
+            options.custom_flags(O_EXCL);
+        }
+        let file = options.open(&path).map_err(|error| {
+            if writable && block_device {
+                Error::Refused(format!(
+                    "cannot open block device exclusively; it may be mounted or busy: {error}"
+                ))
+            } else {
+                Error::Io(error)
+            }
+        })?;
         let metadata = file.metadata()?;
         let block_device = metadata.file_type().is_block_device();
         if !block_device && !metadata.file_type().is_file() {
@@ -63,11 +81,6 @@ impl Device {
                 "device size is zero or not a whole number of logical blocks".into(),
             ));
         }
-        if writable && block_device && is_mounted(metadata.rdev())? {
-            return Err(Error::Refused(
-                "refusing to write a mounted device or a device with mounted partitions".into(),
-            ));
-        }
         let mut device = Self {
             file,
             path,
@@ -86,6 +99,7 @@ impl Device {
                 )));
             }
             device.locked = true;
+            device.ensure_safe_to_write()?;
         }
         Ok(device)
     }
@@ -169,6 +183,32 @@ impl Device {
         Ok(())
     }
 
+    pub(crate) fn ensure_safe_to_write(&self) -> Result<()> {
+        if !self.writable {
+            return Err(Error::Refused("device was opened read-only".into()));
+        }
+        if !self.block_device {
+            return Ok(());
+        }
+        let dev = self.file.metadata()?.rdev();
+        if is_mounted(dev)? {
+            return Err(Error::Refused(
+                "refusing to write a mounted device or a device with mounted partitions".into(),
+            ));
+        }
+        if is_swap(dev)? {
+            return Err(Error::Refused(
+                "refusing to write a device used for swap".into(),
+            ));
+        }
+        if has_holders(dev)? {
+            return Err(Error::Refused(
+                "refusing to write a device used by a kernel storage mapping".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn check_bounds(&self, offset: u64, len: usize) -> Result<()> {
         let end = offset
             .checked_add(len as u64)
@@ -235,6 +275,65 @@ fn is_mounted(dev: u64) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+fn is_swap(dev: u64) -> Result<bool> {
+    let target = sysfs_device(dev);
+    let swaps = match std::fs::read_to_string("/proc/swaps") {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    for line in swaps.lines().skip(1) {
+        let Some(path) = line.split_whitespace().next() else {
+            continue;
+        };
+        let Ok(metadata) = std::fs::metadata(path) else {
+            continue;
+        };
+        if metadata.file_type().is_block_device() {
+            let swap = sysfs_device(metadata.rdev());
+            if swap == target || swap.starts_with(&target) || target.starts_with(&swap) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn has_holders(dev: u64) -> Result<bool> {
+    let target = sysfs_device(dev);
+    if directory_has_entries(&target.join("holders"))? {
+        return Ok(true);
+    }
+    // Whole-disk targets must also account for holders attached to a child
+    // partition (for example LVM, dm-crypt, or MD RAID).
+    let entries = match std::fs::read_dir(&target) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.join("partition").exists() && directory_has_entries(&path.join("holders"))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn directory_has_entries(path: &Path) -> Result<bool> {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => Ok(entries.next().transpose()?.is_some()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn sysfs_device(dev: u64) -> PathBuf {
+    let (major, minor) = major_minor(dev);
+    let path = PathBuf::from(format!("/sys/dev/block/{major}:{minor}"));
+    std::fs::canonicalize(&path).unwrap_or(path)
 }
 
 #[cfg(test)]

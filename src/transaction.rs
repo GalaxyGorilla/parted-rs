@@ -9,7 +9,12 @@ use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"RSPTBK02";
 
-pub fn execute(device: &Device, plan: &Plan, backup_path: &Path) -> Result<()> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitOutcome {
+    pub reread_warning: Option<String>,
+}
+
+pub fn execute(device: &Device, plan: &Plan, backup_path: &Path) -> Result<CommitOutcome> {
     execute_inner(device, plan, backup_path, None)
 }
 
@@ -18,9 +23,16 @@ fn execute_inner(
     plan: &Plan,
     backup_path: &Path,
     fail_after: Option<usize>,
-) -> Result<()> {
+) -> Result<CommitOutcome> {
+    device.ensure_safe_to_write()?;
+    plan.validate_target(device)?;
     let records = collect_originals(device, &plan.writes)?;
     write_backup(device, &records, backup_path)?;
+    // Confirmation and durable backup creation can take time. Recheck both the
+    // live device state and the exact metadata preimage immediately before the
+    // first destructive write.
+    device.ensure_safe_to_write()?;
+    plan.validate_target(device)?;
     for (index, write) in plan.writes.iter().enumerate() {
         if fail_after == Some(index) {
             return Err(Error::Io(std::io::Error::other("injected write failure")));
@@ -31,19 +43,28 @@ fn execute_inner(
     }
     verify_writes(device, &plan.writes)?;
     crate::plan::read_model(device)?;
-    device.reread_partitions()?;
-    Ok(())
+    let reread_warning = device
+        .reread_partitions()
+        .err()
+        .map(|error| error.to_string());
+    Ok(CommitOutcome { reread_warning })
 }
 
-pub fn restore(device: &Device, backup_path: &Path) -> Result<()> {
+pub fn restore(device: &Device, backup_path: &Path) -> Result<CommitOutcome> {
     let records = read_backup(device, backup_path)?;
+    device.ensure_safe_to_write()?;
     for write in &records {
         device.write_lba(write.lba, &write.bytes)?;
+        // Recovery records are ordered secondary-first. Make every phase
+        // durable before allowing the next phase to overwrite primary metadata.
+        device.sync()?;
+        verify_writes(device, std::slice::from_ref(write))?;
     }
-    device.sync()?;
-    verify_writes(device, &records)?;
-    device.reread_partitions()?;
-    Ok(())
+    let reread_warning = device
+        .reread_partitions()
+        .err()
+        .map(|error| error.to_string());
+    Ok(CommitOutcome { reread_warning })
 }
 
 fn collect_originals(device: &Device, writes: &[Write]) -> Result<Vec<Write>> {
@@ -340,5 +361,25 @@ mod tests {
 
         std::fs::remove_file(image).unwrap();
         std::fs::remove_file(backup).unwrap();
+    }
+
+    #[test]
+    fn execute_refuses_metadata_changed_after_planning() {
+        let base = std::env::temp_dir().join(format!("parted-tx-stale-{}", std::process::id()));
+        let image = base.with_extension("img");
+        let backup = base.with_extension("bak");
+        std::fs::write(&image, vec![0; 1024 * 1024]).unwrap();
+
+        let device = Device::open(&image, true, None).unwrap();
+        let plan = plan::mklabel(&device, LabelKind::Mbr).unwrap();
+        device.write_at(0, &[0xa5]).unwrap();
+        device.sync().unwrap();
+
+        let error = execute(&device, &plan, &backup).unwrap_err();
+        assert!(error.to_string().contains("changed after planning"));
+        assert!(!backup.exists());
+        drop(device);
+
+        std::fs::remove_file(image).unwrap();
     }
 }

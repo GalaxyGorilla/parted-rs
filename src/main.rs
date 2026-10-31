@@ -59,15 +59,20 @@ fn run() -> Result<()> {
         }
         confirm(&options, "restore partition-table metadata from backup")?;
         let device = Device::open(path, true, options.image_sector)?;
-        parted::transaction::restore(&device, Path::new(&args[2]))?;
+        let outcome = parted::transaction::restore(&device, Path::new(&args[2]))?;
         if options.json {
-            println!(
-                "{{\"status\":\"restored\",\"backup\":\"{}\"}}",
+            print!(
+                "{{\"status\":\"restored\",\"backup\":\"{}\"",
                 json_escape(&args[2])
             );
+            if let Some(warning) = &outcome.reread_warning {
+                print!(",\"kernel_reread_warning\":\"{}\"", json_escape(warning));
+            }
+            println!("}}");
         } else {
             println!("restored {}", args[2]);
         }
+        print_reread_warning(outcome.reread_warning.as_deref());
         return Ok(());
     }
 
@@ -101,14 +106,25 @@ fn run() -> Result<()> {
     if options.dry_run {
         return Ok(());
     }
-    confirm(&options, &plan.operation)?;
+    confirm(&options, plan.operation())?;
     let backup = options.backup.unwrap_or_else(default_backup_path);
-    parted::transaction::execute(&device, &plan, &backup)?;
+    let outcome = parted::transaction::execute(&device, &plan, &backup).map_err(|error| {
+        Error::Invalid(format!(
+            "commit failed: {error}; recovery backup path (if created): {}",
+            backup.display()
+        ))
+    })?;
     if options.json {
-        print_committed_json(&plan, device.block_size(), &backup)?;
+        print_committed_json(
+            &plan,
+            device.block_size(),
+            &backup,
+            outcome.reread_warning.as_deref(),
+        )?;
     } else {
         println!("committed; recovery backup: {}", backup.display());
     }
+    print_reread_warning(outcome.reread_warning.as_deref());
     Ok(())
 }
 
@@ -322,7 +338,7 @@ fn print_plan(plan: &Plan, block_size: u32, json: bool) -> Result<()> {
     if json {
         print!(
             "{{\"operation\":\"{}\",\"writes\":[",
-            json_escape(&plan.operation)
+            json_escape(plan.operation())
         );
         for (index, range) in ranges.iter().enumerate() {
             if index != 0 {
@@ -335,7 +351,7 @@ fn print_plan(plan: &Plan, block_size: u32, json: bool) -> Result<()> {
         }
         println!("]}}");
     } else {
-        println!("Plan: {}", plan.operation);
+        println!("Plan: {}", plan.operation());
         for range in ranges {
             println!("  write LBA {}..={}", range.first, range.last);
         }
@@ -344,17 +360,22 @@ fn print_plan(plan: &Plan, block_size: u32, json: bool) -> Result<()> {
 }
 
 fn print_plan_stderr(plan: &Plan, block_size: u32) -> Result<()> {
-    eprintln!("Plan: {}", plan.operation);
+    eprintln!("Plan: {}", plan.operation());
     for range in plan.touched_ranges(block_size)? {
         eprintln!("  write LBA {}..={}", range.first, range.last);
     }
     Ok(())
 }
 
-fn print_committed_json(plan: &Plan, block_size: u32, backup: &Path) -> Result<()> {
+fn print_committed_json(
+    plan: &Plan,
+    block_size: u32,
+    backup: &Path,
+    reread_warning: Option<&str>,
+) -> Result<()> {
     print!(
         "{{\"status\":\"committed\",\"operation\":\"{}\",\"backup\":\"{}\",\"writes\":[",
-        json_escape(&plan.operation),
+        json_escape(plan.operation()),
         json_escape(&backup.to_string_lossy())
     );
     for (index, range) in plan.touched_ranges(block_size)?.iter().enumerate() {
@@ -366,8 +387,20 @@ fn print_committed_json(plan: &Plan, block_size: u32, backup: &Path) -> Result<(
             range.first, range.last
         );
     }
-    println!("]}}");
+    print!("]");
+    if let Some(warning) = reread_warning {
+        print!(",\"kernel_reread_warning\":\"{}\"", json_escape(warning));
+    }
+    println!("}}");
     Ok(())
+}
+
+fn print_reread_warning(warning: Option<&str>) {
+    if let Some(warning) = warning {
+        eprintln!(
+            "parted: warning: on-disk commit succeeded, but the kernel did not reread the table: {warning}"
+        );
+    }
 }
 
 fn print_disk(disk: &Disk, json: bool, include_free: bool) -> Result<()> {
