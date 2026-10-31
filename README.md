@@ -29,6 +29,8 @@ code was not inspected, copied, translated, or used as implementation guidance.
 
 Shrinking a partition before shrinking its filesystem can destroy access to
 data. Resize the filesystem first with an appropriate filesystem tool.
+See the [GNU Parted compatibility table](docs/compatibility.md#gnu-parted-compatibility-at-a-glance)
+for unsupported syntax, operations, output formats and migration guidance.
 
 ## Safety and reliability
 
