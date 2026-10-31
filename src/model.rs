@@ -14,8 +14,11 @@ impl LbaRange {
         Ok(Self { first, last })
     }
 
-    pub fn blocks(self) -> u64 {
-        self.last - self.first + 1
+    pub fn blocks(self) -> Result<u64> {
+        self.last
+            .checked_sub(self.first)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| Error::Invalid("invalid or overflowing LBA range".into()))
     }
 
     pub fn overlaps(self, other: Self) -> bool {
@@ -28,7 +31,7 @@ impl LbaRange {
             .checked_mul(block_size)
             .ok_or_else(|| Error::Invalid("byte offset overflow".into()))?;
         let len = self
-            .blocks()
+            .blocks()?
             .checked_mul(block_size)
             .ok_or_else(|| Error::Invalid("byte length overflow".into()))?;
         Ok((start, len))
@@ -162,5 +165,14 @@ mod tests {
     fn exact_alignment() {
         assert_eq!(align_up(2049, 2048).unwrap(), 4096);
         assert_eq!(align_down(4095, 2048).unwrap(), 2048);
+        assert!(
+            LbaRange {
+                first: 0,
+                last: u64::MAX
+            }
+            .blocks()
+            .is_err()
+        );
+        assert!(LbaRange { first: 2, last: 1 }.blocks().is_err());
     }
 }

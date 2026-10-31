@@ -4,10 +4,12 @@ use crate::plan::{Plan, Write};
 use crate::util::{crc32, le_u32, le_u64};
 use crate::{Error, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write as IoWrite};
+use std::io::{Cursor, Read, Write as IoWrite};
 use std::path::Path;
 
-const MAGIC: &[u8; 8] = b"RSPTBK02";
+const MAGIC: &[u8; 8] = b"RSPTBK03";
+const MAX_RECORD_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_BACKUP_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitOutcome {
@@ -109,7 +111,7 @@ fn collect_originals(device: &Device, writes: &[Write]) -> Result<Vec<Write>> {
         .map(|range| {
             Ok(Write {
                 lba: range.first,
-                bytes: device.read_lba(range.first, range.blocks())?,
+                bytes: device.read_lba(range.first, range.blocks()?)?,
             })
         })
         .collect()
@@ -152,26 +154,36 @@ fn current_metadata_ranges(device: &Device) -> Result<Vec<LbaRange>> {
 }
 
 fn write_backup(device: &Device, records: &[Write], path: &Path) -> Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(MAGIC)?;
-    file.write_all(&device.size().to_le_bytes())?;
-    file.write_all(&device.block_size().to_le_bytes())?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(MAGIC);
+    encoded.extend_from_slice(&device.size().to_le_bytes());
+    encoded.extend_from_slice(&device.block_size().to_le_bytes());
     let (identity_kind, identity_value) = device.identity()?;
-    file.write_all(&identity_kind.to_le_bytes())?;
-    file.write_all(&identity_value.to_le_bytes())?;
-    file.write_all(
+    encoded.extend_from_slice(&identity_kind.to_le_bytes());
+    encoded.extend_from_slice(&identity_value.to_le_bytes());
+    encoded.extend_from_slice(
         &u32::try_from(records.len())
             .map_err(|_| Error::Invalid("too many backup records".into()))?
             .to_le_bytes(),
-    )?;
+    );
     for record in records {
-        file.write_all(&record.lba.to_le_bytes())?;
+        encoded.extend_from_slice(&record.lba.to_le_bytes());
         let len = u64::try_from(record.bytes.len())
             .map_err(|_| Error::Invalid("backup record is too large".into()))?;
-        file.write_all(&len.to_le_bytes())?;
-        file.write_all(&crc32(&record.bytes).to_le_bytes())?;
-        file.write_all(&record.bytes)?;
+        if len > MAX_RECORD_BYTES {
+            return Err(Error::Invalid("backup record exceeds safety limit".into()));
+        }
+        encoded.extend_from_slice(&len.to_le_bytes());
+        encoded.extend_from_slice(&crc32(&record.bytes).to_le_bytes());
+        encoded.extend_from_slice(&record.bytes);
+        if encoded.len() as u64 > MAX_BACKUP_BYTES - 4 {
+            return Err(Error::Invalid("backup exceeds safety limit".into()));
+        }
     }
+    let manifest_crc = crc32(&encoded);
+    encoded.extend_from_slice(&manifest_crc.to_le_bytes());
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(&encoded)?;
     file.sync_all()?;
     if let Some(parent) = path.parent() {
         File::open(if parent.as_os_str().is_empty() {
@@ -186,6 +198,26 @@ fn write_backup(device: &Device, records: &[Write], path: &Path) -> Result<()> {
 
 fn read_backup(device: &Device, path: &Path) -> Result<Vec<Write>> {
     let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    if length > MAX_BACKUP_BYTES {
+        return Err(Error::Invalid("backup exceeds safety limit".into()));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(length).map_err(|_| Error::Invalid("backup is too large".into()))?,
+    );
+    file.read_to_end(&mut bytes)?;
+    decode_backup(device, &bytes)
+}
+
+fn decode_backup(device: &Device, bytes: &[u8]) -> Result<Vec<Write>> {
+    if bytes.len() < 4 {
+        return Err(Error::Invalid("backup is truncated".into()));
+    }
+    let (body, trailer) = bytes.split_at(bytes.len() - 4);
+    if crc32(body) != u32::from_le_bytes(trailer.try_into().unwrap()) {
+        return Err(Error::Invalid("backup manifest CRC mismatch".into()));
+    }
+    let mut file = Cursor::new(body);
     let mut magic = [0; 8];
     file.read_exact(&mut magic)?;
     if &magic != MAGIC {
@@ -215,6 +247,7 @@ fn read_backup(device: &Device, path: &Path) -> Result<Vec<Write>> {
         let len = read_u64(&mut file)?;
         if len == 0
             || len % u64::from(block_size) != 0
+            || len > MAX_RECORD_BYTES
             || len > size
             || lba
                 .checked_mul(u64::from(block_size))
@@ -249,8 +282,7 @@ fn read_backup(device: &Device, path: &Path) -> Result<Vec<Write>> {
         }
         records.push(Write { lba, bytes });
     }
-    let mut trailing = [0];
-    if file.read(&mut trailing)? != 0 {
+    if file.position() != body.len() as u64 {
         return Err(Error::Invalid("backup has trailing data".into()));
     }
     Ok(records)
@@ -286,6 +318,12 @@ mod tests {
     use super::*;
     use crate::model::LabelKind;
     use crate::plan;
+
+    fn refresh_manifest_crc(bytes: &mut [u8]) {
+        let split = bytes.len() - 4;
+        let checksum = crc32(&bytes[..split]);
+        bytes[split..].copy_from_slice(&checksum.to_le_bytes());
+    }
 
     #[test]
     fn backup_restores_after_every_injected_write_failure() {
@@ -353,10 +391,61 @@ mod tests {
         let second_lba_offset = 60 + first_len;
         let second_lba = bytes[second_lba_offset..second_lba_offset + 8].to_vec();
         bytes[40..48].copy_from_slice(&second_lba);
+        refresh_manifest_crc(&mut bytes);
         std::fs::write(&backup, bytes).unwrap();
 
         let error = restore(&device, &backup).unwrap_err();
         assert!(error.to_string().contains("overlap"));
+        drop(device);
+
+        std::fs::remove_file(image).unwrap();
+        std::fs::remove_file(backup).unwrap();
+    }
+
+    #[test]
+    fn backup_manifest_rejects_redirected_lba_before_writing() {
+        let base = std::env::temp_dir().join(format!("parted-tx-redirect-{}", std::process::id()));
+        let image = base.with_extension("img");
+        let backup = base.with_extension("bak");
+        std::fs::write(&image, vec![0x5a; 4 * 1024 * 1024]).unwrap();
+
+        let device = Device::open(&image, true, None).unwrap();
+        let plan = plan::mklabel(&device, LabelKind::Gpt).unwrap();
+        execute(&device, &plan, &backup).unwrap();
+        let before = std::fs::read(&image).unwrap();
+        let mut bytes = std::fs::read(&backup).unwrap();
+        bytes[40..48].copy_from_slice(&100_u64.to_le_bytes());
+        // Deliberately leave the manifest CRC unchanged: record metadata is
+        // covered even though its payload and payload CRC remain valid.
+        std::fs::write(&backup, bytes).unwrap();
+
+        let error = restore(&device, &backup).unwrap_err();
+        assert!(error.to_string().contains("manifest CRC"));
+        drop(device);
+        assert_eq!(std::fs::read(&image).unwrap(), before);
+
+        std::fs::remove_file(image).unwrap();
+        std::fs::remove_file(backup).unwrap();
+    }
+
+    #[test]
+    fn every_truncated_backup_is_rejected() {
+        let base = std::env::temp_dir().join(format!("parted-tx-truncated-{}", std::process::id()));
+        let image = base.with_extension("img");
+        let backup = base.with_extension("bak");
+        std::fs::write(&image, vec![0; 1024 * 1024]).unwrap();
+
+        let device = Device::open(&image, true, None).unwrap();
+        let plan = plan::mklabel(&device, LabelKind::Gpt).unwrap();
+        execute(&device, &plan, &backup).unwrap();
+        let bytes = std::fs::read(&backup).unwrap();
+        assert!(decode_backup(&device, &bytes).is_ok());
+        for end in 0..bytes.len() {
+            assert!(
+                decode_backup(&device, &bytes[..end]).is_err(),
+                "accepted backup truncated to {end} bytes"
+            );
+        }
         drop(device);
 
         std::fs::remove_file(image).unwrap();

@@ -490,7 +490,7 @@ fn print_disk(disk: &Disk, json: bool, include_free: bool) -> Result<()> {
                 part.number,
                 part.range.first,
                 part.range.last,
-                part.range.blocks(),
+                part.range.blocks()?,
                 part.type_id,
                 part.unique_id.as_deref().unwrap_or("-"),
                 part.name,
@@ -499,7 +499,7 @@ fn print_disk(disk: &Disk, json: bool, include_free: bool) -> Result<()> {
         }
         if include_free {
             for range in disk.free_space() {
-                println!("free  {}  {}  {}", range.first, range.last, range.blocks());
+                println!("free  {}  {}  {}", range.first, range.last, range.blocks()?);
             }
         }
     }

@@ -34,6 +34,11 @@ impl Device {
         let path = path.as_ref().to_path_buf();
         let path_metadata = std::fs::metadata(&path)?;
         let block_device = path_metadata.file_type().is_block_device();
+        if !block_device && !path_metadata.file_type().is_file() {
+            return Err(Error::Refused(
+                "device must be a regular file or Linux block device".into(),
+            ));
+        }
         let mut options = OpenOptions::new();
         options.read(true).write(writable);
         if writable && block_device {

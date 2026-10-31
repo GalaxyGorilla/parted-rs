@@ -129,7 +129,7 @@ pub fn mkpart(
             }
             let first_lba = u32::try_from(range.first)
                 .map_err(|_| Error::Invalid("MBR start exceeds 32-bit LBA".into()))?;
-            let sectors = u32::try_from(range.blocks())
+            let sectors = u32::try_from(range.blocks()?)
                 .map_err(|_| Error::Invalid("MBR length exceeds 32-bit sector count".into()))?;
             let partition_type = match type_id {
                 Some(text) => u8::from_str_radix(text.trim_start_matches("0x"), 16)

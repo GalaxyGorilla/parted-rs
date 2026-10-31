@@ -36,10 +36,19 @@ pub fn le_u64(bytes: &[u8]) -> u64 {
 }
 
 pub fn parse_guid(text: &str) -> Result<[u8; 16]> {
-    let hex: String = text.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    let bytes = text.as_bytes();
+    let valid = match bytes.len() {
+        32 => bytes.iter().all(u8::is_ascii_hexdigit),
+        36 => bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        }),
+        _ => false,
+    };
+    if !valid {
         return Err(Error::Invalid(format!("invalid GUID: {text}")));
     }
+    let hex = text.replace('-', "");
     let mut canonical = [0_u8; 16];
     for (i, byte) in canonical.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
@@ -89,6 +98,20 @@ mod tests {
     fn guid_disk_byte_order_roundtrip() {
         let text = "00112233-4455-6677-8899-aabbccddeeff";
         assert_eq!(format_guid(parse_guid(text).unwrap()), text);
+        assert_eq!(
+            format_guid(parse_guid("00112233445566778899aabbccddeeff").unwrap()),
+            text
+        );
+        for malformed in [
+            "-00112233445566778899aabbccddeeff",
+            "00112233445566778899aabbccddeeff-",
+            "0011-2233445566778899aabbccddeeff",
+            "00112233-4455-6677-8899a-abbccddeeff",
+            "00112233-4455-6677-8899-aabbccddeefg",
+            "é0112233-4455-6677-8899-aabbccddeeff",
+        ] {
+            assert!(parse_guid(malformed).is_err(), "accepted {malformed}");
+        }
     }
 
     #[test]
