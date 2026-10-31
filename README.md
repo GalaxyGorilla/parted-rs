@@ -165,6 +165,7 @@ cargo install --path . --locked
 
 ## Documentation
 
+- [Test strategy and hardware boundary](TESTING.md)
 - [Safety model](docs/safety.md)
 - [Compatibility and deliberate limits](docs/compatibility.md)
 - [Architecture and commit protocol](docs/architecture.md)
